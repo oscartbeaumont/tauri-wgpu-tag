@@ -17,12 +17,26 @@ struct WgpuSlotSyncPayload {
     dpr: f64,
     z_index: i64,
     paint_order: i64,
-    top: f64,
+    slot_seq: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WgpuSlotsSyncBatchPayload {
+    frame_seq: u64,
+    updates: Vec<WgpuSlotSyncPayload>,
 }
 
 #[derive(Default)]
 struct WgpuSlotState {
-    slots: Arc<Mutex<HashMap<String, SlotEntry>>>,
+    inner: Arc<Mutex<WgpuSlotInnerState>>,
+}
+
+#[derive(Default)]
+struct WgpuSlotInnerState {
+    slots: HashMap<String, SlotEntry>,
+    native_order: Vec<String>,
+    last_slot_seq: HashMap<String, u64>,
 }
 
 struct SlotEntry {
@@ -32,7 +46,9 @@ struct SlotEntry {
     renderer: Option<SlotRenderer>,
     z_index: i64,
     paint_order: i64,
-    top: f64,
+    last_pixel_width: u32,
+    last_pixel_height: u32,
+    last_dpr: f64,
 }
 
 #[cfg(target_os = "macos")]
@@ -305,6 +321,12 @@ unsafe fn update_overlay_frame(
         NSSize::new(width, height),
     );
     let _: () = msg_send![native_view, setFrame: frame];
+
+    let layer: cocoa_id = msg_send![native_view, layer];
+    if !layer.is_null() {
+        let _: () = msg_send![layer, setContentsScale: payload.dpr];
+    }
+
     Ok(())
 }
 
@@ -354,27 +376,56 @@ unsafe fn get_content_view_height(content_view_ptr: usize) -> Result<f64, String
 }
 
 #[cfg(target_os = "macos")]
-fn sorted_native_views(map: &HashMap<String, SlotEntry>) -> Vec<usize> {
-    let mut slots = map.values().collect::<Vec<_>>();
-    slots.sort_by(|a, b| {
+fn sorted_slot_ids(map: &HashMap<String, SlotEntry>) -> Vec<String> {
+    let mut slots = map.iter().collect::<Vec<_>>();
+    slots.sort_by(|(id_a, a), (id_b, b)| {
         a.z_index
             .cmp(&b.z_index)
             .then_with(|| a.paint_order.cmp(&b.paint_order))
-            .then_with(|| {
-                a.top
-                    .partial_cmp(&b.top)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .then_with(|| id_a.cmp(id_b))
     });
 
-    slots.into_iter().map(|slot| slot.native_view_ptr).collect()
+    slots.into_iter().map(|(id, _)| id.clone()).collect()
+}
+
+#[cfg(target_os = "macos")]
+fn pixel_size(width: f64, height: f64, dpr: f64) -> (u32, u32) {
+    let px_width = (width * dpr).round().max(1.0) as u32;
+    let px_height = (height * dpr).round().max(1.0) as u32;
+    (px_width, px_height)
+}
+
+#[cfg(target_os = "macos")]
+struct NoAnimationTransaction;
+
+#[cfg(target_os = "macos")]
+impl NoAnimationTransaction {
+    unsafe fn begin() -> Self {
+        use cocoa::base::YES;
+        use objc::{class, msg_send, sel, sel_impl};
+
+        let _: () = msg_send![class!(CATransaction), begin];
+        let _: () = msg_send![class!(CATransaction), setDisableActions: YES];
+        Self
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for NoAnimationTransaction {
+    fn drop(&mut self) {
+        use objc::{class, msg_send, sel, sel_impl};
+
+        unsafe {
+            let _: () = msg_send![class!(CATransaction), commit];
+        }
+    }
 }
 
 #[tauri::command]
-fn wgpu_slot_sync(
+fn wgpu_slots_sync_batch(
     app: AppHandle,
     state: State<'_, WgpuSlotState>,
-    payload: WgpuSlotSyncPayload,
+    payload: WgpuSlotsSyncBatchPayload,
 ) -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -386,88 +437,119 @@ fn wgpu_slot_sync(
 
     #[cfg(target_os = "macos")]
     {
+        let _ = payload.frame_seq;
+
         let window = app
             .get_webview_window("main")
             .ok_or_else(|| "main window was not found".to_string())?;
 
         let content_view_ptr = get_main_content_view_ptr(&window)?;
-        let slots = state.slots.clone();
-
-        if !payload.mounted {
-            let slot_id = payload.id.clone();
-            run_on_main_thread_sync(&window, move || {
-                let mut slots = slots
-                    .lock()
-                    .map_err(|_| "slot state lock poisoned".to_string())?;
-
-                if let Some(slot) = slots.remove(&slot_id) {
-                    unsafe {
-                        remove_overlay_view(content_view_ptr, slot.native_view_ptr);
-                    }
-                }
-
-                Ok(())
-            })?;
-
-            return Ok(());
-        }
+        let inner = state.inner.clone();
 
         run_on_main_thread_sync(&window, move || {
-            let mut slots = slots
+            let mut inner = inner
                 .lock()
                 .map_err(|_| "slot state lock poisoned".to_string())?;
-
-            let native_view_ptr = match slots.get(&payload.id) {
-                Some(slot) => slot.native_view_ptr,
-                None => {
-                    let native_view_ptr = unsafe { create_overlay_view(content_view_ptr)? };
-                    slots.insert(
-                        payload.id.clone(),
-                        SlotEntry {
-                            native_view_ptr,
-                            renderer: None,
-                            z_index: payload.z_index,
-                            paint_order: payload.paint_order,
-                            top: payload.top,
-                        },
-                    );
-                    native_view_ptr
-                }
-            };
-
-            {
-                let slot = slots
-                    .get_mut(&payload.id)
-                    .ok_or_else(|| "slot should exist after create/update".to_string())?;
-                slot.z_index = payload.z_index;
-                slot.paint_order = payload.paint_order;
-                slot.top = payload.top;
-            }
-
-            let reorder_ptrs = sorted_native_views(&slots);
             let content_height = unsafe { get_content_view_height(content_view_ptr)? };
-            unsafe {
-                update_overlay_frame(native_view_ptr, content_height, &payload)?;
-                reorder_overlay_views(content_view_ptr, &reorder_ptrs)?;
+            let _transaction = unsafe { NoAnimationTransaction::begin() };
+
+            for update in payload.updates {
+                let last_seq = inner.last_slot_seq.get(&update.id).copied().unwrap_or(0);
+                if update.slot_seq <= last_seq {
+                    continue;
+                }
+                inner
+                    .last_slot_seq
+                    .insert(update.id.clone(), update.slot_seq);
+
+                if !update.mounted {
+                    if let Some(slot) = inner.slots.remove(&update.id) {
+                        unsafe {
+                            remove_overlay_view(content_view_ptr, slot.native_view_ptr);
+                        }
+                    }
+                    continue;
+                }
+
+                let native_view_ptr = match inner.slots.get(&update.id) {
+                    Some(slot) => slot.native_view_ptr,
+                    None => {
+                        let native_view_ptr = unsafe { create_overlay_view(content_view_ptr)? };
+                        inner.slots.insert(
+                            update.id.clone(),
+                            SlotEntry {
+                                native_view_ptr,
+                                renderer: None,
+                                z_index: update.z_index,
+                                paint_order: update.paint_order,
+                                last_pixel_width: 0,
+                                last_pixel_height: 0,
+                                last_dpr: 0.0,
+                            },
+                        );
+                        native_view_ptr
+                    }
+                };
+
+                {
+                    let slot = inner
+                        .slots
+                        .get_mut(&update.id)
+                        .ok_or_else(|| "slot should exist after create/update".to_string())?;
+                    slot.z_index = update.z_index;
+                    slot.paint_order = update.paint_order;
+                }
+
+                unsafe {
+                    update_overlay_frame(native_view_ptr, content_height, &update)?;
+                }
+
+                {
+                    let slot = inner
+                        .slots
+                        .get_mut(&update.id)
+                        .ok_or_else(|| "slot should exist for render".to_string())?;
+                    if slot.renderer.is_none() {
+                        slot.renderer = Some(SlotRenderer::new(
+                            slot.native_view_ptr,
+                            update.width,
+                            update.height,
+                            update.dpr,
+                        )?);
+                        let (px_width, px_height) =
+                            pixel_size(update.width, update.height, update.dpr);
+                        slot.last_pixel_width = px_width;
+                        slot.last_pixel_height = px_height;
+                        slot.last_dpr = update.dpr;
+                    }
+
+                    if let Some(renderer) = slot.renderer.as_mut() {
+                        let (px_width, px_height) =
+                            pixel_size(update.width, update.height, update.dpr);
+                        if slot.last_pixel_width != px_width
+                            || slot.last_pixel_height != px_height
+                            || (slot.last_dpr - update.dpr).abs() > f64::EPSILON
+                        {
+                            renderer.resize(update.width, update.height, update.dpr);
+                            slot.last_pixel_width = px_width;
+                            slot.last_pixel_height = px_height;
+                            slot.last_dpr = update.dpr;
+                        }
+                        renderer.render()?;
+                    }
+                }
             }
 
-            {
-                let slot = slots
-                    .get_mut(&payload.id)
-                    .ok_or_else(|| "slot should exist for render".to_string())?;
-                if slot.renderer.is_none() {
-                    slot.renderer = Some(SlotRenderer::new(
-                        slot.native_view_ptr,
-                        payload.width,
-                        payload.height,
-                        payload.dpr,
-                    )?);
+            let target_order = sorted_slot_ids(&inner.slots);
+            if target_order != inner.native_order {
+                let reorder_ptrs = target_order
+                    .iter()
+                    .filter_map(|slot_id| inner.slots.get(slot_id).map(|slot| slot.native_view_ptr))
+                    .collect::<Vec<_>>();
+                unsafe {
+                    reorder_overlay_views(content_view_ptr, &reorder_ptrs)?;
                 }
-
-                if let Some(renderer) = slot.renderer.as_mut() {
-                    renderer.resize(payload.width, payload.height, payload.dpr);
-                    renderer.render()?;
-                }
+                inner.native_order = target_order;
             }
 
             Ok(())
@@ -480,7 +562,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(WgpuSlotState::default())
-        .invoke_handler(tauri::generate_handler![wgpu_slot_sync])
+        .invoke_handler(tauri::generate_handler![wgpu_slots_sync_batch])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

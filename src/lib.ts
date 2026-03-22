@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-type SlotSyncPayload = {
+type SlotSyncUpdate = {
   id: string;
   mounted: boolean;
   x: number;
@@ -10,15 +10,23 @@ type SlotSyncPayload = {
   dpr: number;
   zIndex: number;
   paintOrder: number;
-  top: number;
+  slotSeq: number;
+};
+
+type SlotSyncBatchPayload = {
+  frameSeq: number;
+  updates: SlotSyncUpdate[];
 };
 
 const TAG_NAME = "tauri-wgpu";
 const DIRTY_ELEMENTS = new Set<TauriWgpuElement>();
+const PENDING_UPDATES = new Map<string, SlotSyncUpdate>();
 
 let rafId: number | null = null;
+let syncInFlight = false;
 let globalListenersInstalled = false;
 let idCounter = 0;
+let frameSeq = 0;
 
 const startupReady = new Promise<void>((resolve) => {
   const finish = () => {
@@ -69,17 +77,61 @@ function getPaintOrderMap(): Map<string, number> {
   return map;
 }
 
-async function sendSync(payload: SlotSyncPayload): Promise<void> {
+async function sendSync(payload: SlotSyncBatchPayload): Promise<boolean> {
   try {
     await startupReady;
 
-    if (document.visibilityState !== "visible") {
-      return;
-    }
-
-    await invoke("wgpu_slot_sync", { payload });
+    await invoke("wgpu_slots_sync_batch", { payload });
+    return true;
   } catch (error) {
-    console.error("[tauri-wgpu] failed to sync slot", payload.id, error);
+    console.error("[tauri-wgpu] failed to sync batch", payload, error);
+    return false;
+  }
+}
+
+function mergePendingUpdate(update: SlotSyncUpdate): void {
+  const previous = PENDING_UPDATES.get(update.id);
+  if (!previous || update.slotSeq >= previous.slotSeq) {
+    PENDING_UPDATES.set(update.id, update);
+  }
+}
+
+function enqueueUpdate(update: SlotSyncUpdate): void {
+  mergePendingUpdate(update);
+  void flushPendingUpdatesToNative();
+}
+
+async function flushPendingUpdatesToNative(): Promise<void> {
+  if (syncInFlight || PENDING_UPDATES.size === 0) {
+    return;
+  }
+
+  if (document.visibilityState !== "visible") {
+    return;
+  }
+
+  const updates = Array.from(PENDING_UPDATES.values());
+  PENDING_UPDATES.clear();
+
+  const payload: SlotSyncBatchPayload = {
+    frameSeq: (frameSeq += 1),
+    updates,
+  };
+
+  syncInFlight = true;
+
+  try {
+    const success = await sendSync(payload);
+    if (!success) {
+      for (const update of updates) {
+        mergePendingUpdate(update);
+      }
+    }
+  } finally {
+    syncInFlight = false;
+    if (PENDING_UPDATES.size > 0) {
+      void flushPendingUpdatesToNative();
+    }
   }
 }
 
@@ -93,8 +145,10 @@ function flushDirtyElements(): void {
   DIRTY_ELEMENTS.clear();
 
   for (const element of pending) {
-    void element.flushSync(paintOrderMap);
+    element.flushSync(paintOrderMap);
   }
+
+  void flushPendingUpdatesToNative();
 }
 
 function installGlobalListeners(): void {
@@ -110,6 +164,12 @@ function installGlobalListeners(): void {
 
   window.addEventListener("scroll", invalidateAll, { passive: true });
   window.addEventListener("resize", invalidateAll, { passive: true });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      invalidateAll();
+      void flushPendingUpdatesToNative();
+    }
+  });
   globalListenersInstalled = true;
 }
 
@@ -119,6 +179,12 @@ class TauriWgpuElement extends HTMLElement {
   private mounted = false;
   private resizeObserver: ResizeObserver | null = null;
   private mutationObserver: MutationObserver | null = null;
+  private slotSeq = 0;
+
+  nextSlotSeq(): number {
+    this.slotSeq += 1;
+    return this.slotSeq;
+  }
 
   connectedCallback(): void {
     if (!this.slotId) {
@@ -144,7 +210,7 @@ class TauriWgpuElement extends HTMLElement {
     DIRTY_ELEMENTS.delete(this);
     this.cleanupObservers();
 
-    const payload: SlotSyncPayload = {
+    const payload: SlotSyncUpdate = {
       id: this.slotId,
       mounted: false,
       x: 0,
@@ -154,10 +220,10 @@ class TauriWgpuElement extends HTMLElement {
       dpr: window.devicePixelRatio || 1,
       zIndex: 0,
       paintOrder: 0,
-      top: 0,
+      slotSeq: this.nextSlotSeq(),
     };
 
-    void sendSync(payload);
+    enqueueUpdate(payload);
   }
 
   setupObservers(): void {
@@ -183,7 +249,7 @@ class TauriWgpuElement extends HTMLElement {
     this.mutationObserver = null;
   }
 
-  async flushSync(paintOrderMap: Map<string, number>): Promise<void> {
+  flushSync(paintOrderMap: Map<string, number>): void {
     if (!this.mounted || !this.isConnected) {
       return;
     }
@@ -193,7 +259,7 @@ class TauriWgpuElement extends HTMLElement {
     const zIndex = toNumber(style.zIndex);
     const paintOrder = paintOrderMap.get(this.slotId) ?? 0;
 
-    const payload: SlotSyncPayload = {
+    const payload: SlotSyncUpdate = {
       id: this.slotId,
       mounted: true,
       x: rect.left,
@@ -203,10 +269,10 @@ class TauriWgpuElement extends HTMLElement {
       dpr: window.devicePixelRatio || 1,
       zIndex,
       paintOrder,
-      top: rect.top,
+      slotSeq: this.nextSlotSeq(),
     };
 
-    await sendSync(payload);
+    enqueueUpdate(payload);
   }
 }
 
