@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Arc, Mutex},
 };
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 
@@ -22,14 +22,14 @@ struct WgpuSlotSyncPayload {
 
 #[derive(Default)]
 struct WgpuSlotState {
-    slots: Mutex<HashMap<String, SlotEntry>>,
+    slots: Arc<Mutex<HashMap<String, SlotEntry>>>,
 }
 
 struct SlotEntry {
     #[cfg(target_os = "macos")]
     native_view_ptr: usize,
     #[cfg(target_os = "macos")]
-    renderer: SlotRenderer,
+    renderer: Option<SlotRenderer>,
     z_index: i64,
     paint_order: i64,
     top: f64,
@@ -46,12 +46,7 @@ struct SlotRenderer {
 
 #[cfg(target_os = "macos")]
 impl SlotRenderer {
-    async fn new(
-        native_view_ptr: usize,
-        width: f64,
-        height: f64,
-        dpr: f64,
-    ) -> Result<Self, String> {
+    fn new(native_view_ptr: usize, width: f64, height: f64, dpr: f64) -> Result<Self, String> {
         use raw_window_handle::{
             AppKitDisplayHandle, AppKitWindowHandle, RawDisplayHandle, RawWindowHandle,
         };
@@ -72,27 +67,23 @@ impl SlotRenderer {
         }
         .map_err(|e| format!("failed to create wgpu surface: {e}"))?;
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: Some(&surface),
-            })
-            .await
-            .ok_or_else(|| "failed to get adapter".to_string())?;
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: Some(&surface),
+        }))
+        .ok_or_else(|| "failed to get adapter".to_string())?;
 
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("tauri-wgpu-slot-device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                    memory_hints: wgpu::MemoryHints::Performance,
-                },
-                None,
-            )
-            .await
-            .map_err(|e| format!("failed to create device: {e}"))?;
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("tauri-wgpu-slot-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::Performance,
+            },
+            None,
+        ))
+        .map_err(|e| format!("failed to create device: {e}"))?;
 
         let capabilities = surface.get_capabilities(&adapter);
         let format = capabilities
@@ -220,10 +211,10 @@ fn run_on_main_thread_sync<T: Send + 'static>(
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn create_or_get_overlay_view(content_view_ptr: usize, id: &str) -> Result<usize, String> {
+unsafe fn create_overlay_view(content_view_ptr: usize) -> Result<usize, String> {
     use cocoa::{
-        base::{id as cocoa_id, nil, NO},
-        foundation::{NSPoint, NSRect, NSSize, NSString},
+        base::{id as cocoa_id, NO},
+        foundation::{NSPoint, NSRect, NSSize},
     };
     use objc::{class, msg_send, runtime::Class, sel, sel_impl};
 
@@ -262,19 +253,10 @@ unsafe fn create_or_get_overlay_view(content_view_ptr: usize, id: &str) -> Resul
         return Err("main content view is null".to_string());
     }
 
-    let slot_id = format!("tauri-wgpu-slot-{id}");
-    let identifier = NSString::alloc(nil).init_str(&slot_id);
-
-    let existing: cocoa_id = msg_send![content_view, viewWithIdentifier: identifier];
-    if !existing.is_null() {
-        return Ok(existing as usize);
-    }
-
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0));
     let view_class = passthrough_view_class();
     let view: cocoa_id = msg_send![view_class, alloc];
     let view: cocoa_id = msg_send![view, initWithFrame: frame];
-    let _: () = msg_send![view, setIdentifier: identifier];
     let _: () = msg_send![view, setWantsLayer: cocoa::base::YES];
 
     let layer: cocoa_id = msg_send![class!(CAMetalLayer), layer];
@@ -299,32 +281,24 @@ unsafe fn remove_overlay_view(content_view_ptr: usize, native_view_ptr: usize) {
 
 #[cfg(target_os = "macos")]
 unsafe fn update_overlay_frame(
-    content_view_ptr: usize,
+    native_view_ptr: usize,
+    content_height: f64,
     payload: &WgpuSlotSyncPayload,
 ) -> Result<(), String> {
     use cocoa::{
-        appkit::NSView,
         base::id as cocoa_id,
-        foundation::{NSPoint, NSRect, NSSize, NSString},
+        foundation::{NSPoint, NSRect, NSSize},
     };
     use objc::{msg_send, sel, sel_impl};
 
-    let content_view = content_view_ptr as cocoa_id;
-    if content_view.is_null() {
-        return Err("main content view is null".to_string());
-    }
-
-    let slot_id = format!("tauri-wgpu-slot-{}", payload.id);
-    let identifier = cocoa::foundation::NSString::alloc(cocoa::base::nil).init_str(&slot_id);
-    let native_view: cocoa_id = msg_send![content_view, viewWithIdentifier: identifier];
+    let native_view = native_view_ptr as cocoa_id;
     if native_view.is_null() {
         return Err("native slot view not found".to_string());
     }
 
-    let content_bounds = NSView::bounds(content_view);
     let width = payload.width.max(1.0);
     let height = payload.height.max(1.0);
-    let appkit_y = content_bounds.size.height - payload.y - height;
+    let appkit_y = content_height - payload.y - height;
 
     let frame = NSRect::new(
         NSPoint::new(payload.x, appkit_y),
@@ -368,6 +342,18 @@ fn get_main_content_view_ptr(window: &WebviewWindow) -> Result<usize, String> {
 }
 
 #[cfg(target_os = "macos")]
+unsafe fn get_content_view_height(content_view_ptr: usize) -> Result<f64, String> {
+    use cocoa::{appkit::NSView, base::id as cocoa_id};
+
+    let content_view = content_view_ptr as cocoa_id;
+    if content_view.is_null() {
+        return Err("main content view is null".to_string());
+    }
+
+    Ok(NSView::bounds(content_view).size.height)
+}
+
+#[cfg(target_os = "macos")]
 fn sorted_native_views(map: &HashMap<String, SlotEntry>) -> Vec<usize> {
     let mut slots = map.values().collect::<Vec<_>>();
     slots.sort_by(|a, b| {
@@ -385,7 +371,7 @@ fn sorted_native_views(map: &HashMap<String, SlotEntry>) -> Vec<usize> {
 }
 
 #[tauri::command]
-async fn wgpu_slot_sync(
+fn wgpu_slot_sync(
     app: AppHandle,
     state: State<'_, WgpuSlotState>,
     payload: WgpuSlotSyncPayload,
@@ -405,102 +391,87 @@ async fn wgpu_slot_sync(
             .ok_or_else(|| "main window was not found".to_string())?;
 
         let content_view_ptr = get_main_content_view_ptr(&window)?;
+        let slots = state.slots.clone();
 
         if !payload.mounted {
-            let mut slots = state
-                .slots
-                .lock()
-                .map_err(|_| "slot state lock poisoned".to_string())?;
+            let slot_id = payload.id.clone();
+            run_on_main_thread_sync(&window, move || {
+                let mut slots = slots
+                    .lock()
+                    .map_err(|_| "slot state lock poisoned".to_string())?;
 
-            if let Some(slot) = slots.remove(&payload.id) {
-                let native_view_ptr = slot.native_view_ptr;
-                run_on_main_thread_sync(&window, move || unsafe {
-                    remove_overlay_view(content_view_ptr, native_view_ptr);
-                    Ok(())
-                })?;
-            }
+                if let Some(slot) = slots.remove(&slot_id) {
+                    unsafe {
+                        remove_overlay_view(content_view_ptr, slot.native_view_ptr);
+                    }
+                }
+
+                Ok(())
+            })?;
 
             return Ok(());
         }
 
-        let needs_create = {
-            let slots = state
-                .slots
-                .lock()
-                .map_err(|_| "slot state lock poisoned".to_string())?;
-            !slots.contains_key(&payload.id)
-        };
-
-        if needs_create {
-            let slot_id = payload.id.clone();
-            let native_view_ptr = run_on_main_thread_sync(&window, move || unsafe {
-                create_or_get_overlay_view(content_view_ptr, &slot_id)
-            })?;
-
-            let renderer =
-                SlotRenderer::new(native_view_ptr, payload.width, payload.height, payload.dpr)
-                    .await?;
-
-            let mut slots = state
-                .slots
-                .lock()
-                .map_err(|_| "slot state lock poisoned".to_string())?;
-            slots.insert(
-                payload.id.clone(),
-                SlotEntry {
-                    native_view_ptr,
-                    renderer,
-                    z_index: payload.z_index,
-                    paint_order: payload.paint_order,
-                    top: payload.top,
-                },
-            );
-        }
-
-        {
-            let mut slots = state
-                .slots
+        run_on_main_thread_sync(&window, move || {
+            let mut slots = slots
                 .lock()
                 .map_err(|_| "slot state lock poisoned".to_string())?;
 
-            let slot = slots
-                .get_mut(&payload.id)
-                .ok_or_else(|| "slot should exist after create/update".to_string())?;
+            let native_view_ptr = match slots.get(&payload.id) {
+                Some(slot) => slot.native_view_ptr,
+                None => {
+                    let native_view_ptr = unsafe { create_overlay_view(content_view_ptr)? };
+                    slots.insert(
+                        payload.id.clone(),
+                        SlotEntry {
+                            native_view_ptr,
+                            renderer: None,
+                            z_index: payload.z_index,
+                            paint_order: payload.paint_order,
+                            top: payload.top,
+                        },
+                    );
+                    native_view_ptr
+                }
+            };
 
-            slot.z_index = payload.z_index;
-            slot.paint_order = payload.paint_order;
-            slot.top = payload.top;
-        }
+            {
+                let slot = slots
+                    .get_mut(&payload.id)
+                    .ok_or_else(|| "slot should exist after create/update".to_string())?;
+                slot.z_index = payload.z_index;
+                slot.paint_order = payload.paint_order;
+                slot.top = payload.top;
+            }
 
-        let reorder_ptrs = {
-            let slots = state
-                .slots
-                .lock()
-                .map_err(|_| "slot state lock poisoned".to_string())?;
-            sorted_native_views(&slots)
-        };
+            let reorder_ptrs = sorted_native_views(&slots);
+            let content_height = unsafe { get_content_view_height(content_view_ptr)? };
+            unsafe {
+                update_overlay_frame(native_view_ptr, content_height, &payload)?;
+                reorder_overlay_views(content_view_ptr, &reorder_ptrs)?;
+            }
 
-        let payload_for_frame = payload.clone();
-        run_on_main_thread_sync(&window, move || unsafe {
-            update_overlay_frame(content_view_ptr, &payload_for_frame)?;
-            reorder_overlay_views(content_view_ptr, &reorder_ptrs)?;
+            {
+                let slot = slots
+                    .get_mut(&payload.id)
+                    .ok_or_else(|| "slot should exist for render".to_string())?;
+                if slot.renderer.is_none() {
+                    slot.renderer = Some(SlotRenderer::new(
+                        slot.native_view_ptr,
+                        payload.width,
+                        payload.height,
+                        payload.dpr,
+                    )?);
+                }
+
+                if let Some(renderer) = slot.renderer.as_mut() {
+                    renderer.resize(payload.width, payload.height, payload.dpr);
+                    renderer.render()?;
+                }
+            }
+
             Ok(())
-        })?;
-
-        {
-            let mut slots = state
-                .slots
-                .lock()
-                .map_err(|_| "slot state lock poisoned".to_string())?;
-            let slot = slots
-                .get_mut(&payload.id)
-                .ok_or_else(|| "slot should exist for render".to_string())?;
-            slot.renderer
-                .resize(payload.width, payload.height, payload.dpr);
-            slot.renderer.render()?;
-        }
-
-        Ok(())
+        })
     }
 }
 

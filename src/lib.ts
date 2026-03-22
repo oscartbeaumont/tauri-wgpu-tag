@@ -20,6 +20,21 @@ let rafId: number | null = null;
 let globalListenersInstalled = false;
 let idCounter = 0;
 
+const startupReady = new Promise<void>((resolve) => {
+  const finish = () => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => resolve());
+    });
+  };
+
+  if (document.readyState === "complete") {
+    finish();
+    return;
+  }
+
+  window.addEventListener("load", finish, { once: true });
+});
+
 function toNumber(value: string): number {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -56,6 +71,12 @@ function getPaintOrderMap(): Map<string, number> {
 
 async function sendSync(payload: SlotSyncPayload): Promise<void> {
   try {
+    await startupReady;
+
+    if (document.visibilityState !== "visible") {
+      return;
+    }
+
     await invoke("wgpu_slot_sync", { payload });
   } catch (error) {
     console.error("[tauri-wgpu] failed to sync slot", payload.id, error);
@@ -114,6 +135,8 @@ class TauriWgpuElement extends HTMLElement {
     installGlobalListeners();
     this.setupObservers();
     markDirty(this);
+    window.setTimeout(() => markDirty(this), 250);
+    window.setTimeout(() => markDirty(this), 1000);
   }
 
   disconnectedCallback(): void {
