@@ -22,3 +22,6 @@ target
 
 # JS
 node_modules
+
+# System files
+.DS_Store
