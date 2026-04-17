@@ -11,6 +11,8 @@ pnpm tauri dev
 
 ## TODO
 
+ - [ ] Document this works best for fixed-size elements? Can we force it? Maybe have a custom way of resizing which can be coordinated with Rust?
+
  - [ ] Can this be more generic than wgpu, just native slots???
  - [ ] Multiple native surfaces visible at once
  - [ ] Mouse click events should pass-through

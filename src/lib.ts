@@ -7,6 +7,12 @@ type SlotSyncUpdate = {
   y: number;
   width: number;
   height: number;
+  logicalX: number;
+  logicalY: number;
+  logicalWidth: number;
+  logicalHeight: number;
+  viewportLogicalWidth: number;
+  viewportLogicalHeight: number;
   dpr: number;
   zIndex: number;
   paintOrder: number;
@@ -46,6 +52,14 @@ const startupReady = new Promise<void>((resolve) => {
 function toNumber(value: string): number {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function getViewportLogicalSize(): { width: number; height: number } {
+  const root = document.documentElement;
+  return {
+    width: root.clientWidth || window.innerWidth || 0,
+    height: root.clientHeight || window.innerHeight || 0,
+  };
 }
 
 function scheduleFlush(): void {
@@ -217,6 +231,12 @@ class TauriWgpuElement extends HTMLElement {
       y: 0,
       width: 0,
       height: 0,
+      logicalX: 0,
+      logicalY: 0,
+      logicalWidth: 0,
+      logicalHeight: 0,
+      viewportLogicalWidth: 0,
+      viewportLogicalHeight: 0,
       dpr: window.devicePixelRatio || 1,
       zIndex: 0,
       paintOrder: 0,
@@ -258,6 +278,7 @@ class TauriWgpuElement extends HTMLElement {
     const style = window.getComputedStyle(this);
     const zIndex = toNumber(style.zIndex);
     const paintOrder = paintOrderMap.get(this.slotId) ?? 0;
+    const viewportLogicalSize = getViewportLogicalSize();
 
     const payload: SlotSyncUpdate = {
       id: this.slotId,
@@ -266,6 +287,12 @@ class TauriWgpuElement extends HTMLElement {
       y: rect.top,
       width: rect.width,
       height: rect.height,
+      logicalX: rect.left,
+      logicalY: rect.top,
+      logicalWidth: rect.width,
+      logicalHeight: rect.height,
+      viewportLogicalWidth: viewportLogicalSize.width,
+      viewportLogicalHeight: viewportLogicalSize.height,
       dpr: window.devicePixelRatio || 1,
       zIndex,
       paintOrder,

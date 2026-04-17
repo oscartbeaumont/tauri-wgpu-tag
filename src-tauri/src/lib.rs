@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     sync::{mpsc, Arc, Mutex},
 };
-use tauri::{AppHandle, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Manager, State, WebviewWindow, WindowEvent};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -14,6 +14,12 @@ struct WgpuSlotSyncPayload {
     y: f64,
     width: f64,
     height: f64,
+    logical_x: f64,
+    logical_y: f64,
+    logical_width: f64,
+    logical_height: f64,
+    viewport_logical_width: f64,
+    viewport_logical_height: f64,
     dpr: f64,
     z_index: i64,
     paint_order: i64,
@@ -49,6 +55,21 @@ struct SlotEntry {
     last_pixel_width: u32,
     last_pixel_height: u32,
     last_dpr: f64,
+    logical_x: f64,
+    logical_y: f64,
+    logical_width: f64,
+    logical_height: f64,
+    viewport_logical_width: f64,
+    viewport_logical_height: f64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct EstimatedSlotFrame {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
 }
 
 #[cfg(target_os = "macos")]
@@ -299,7 +320,11 @@ unsafe fn remove_overlay_view(content_view_ptr: usize, native_view_ptr: usize) {
 unsafe fn update_overlay_frame(
     native_view_ptr: usize,
     content_height: f64,
-    payload: &WgpuSlotSyncPayload,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    dpr: f64,
 ) -> Result<(), String> {
     use cocoa::{
         base::id as cocoa_id,
@@ -312,19 +337,16 @@ unsafe fn update_overlay_frame(
         return Err("native slot view not found".to_string());
     }
 
-    let width = payload.width.max(1.0);
-    let height = payload.height.max(1.0);
-    let appkit_y = content_height - payload.y - height;
+    let width = width.max(1.0);
+    let height = height.max(1.0);
+    let appkit_y = content_height - y - height;
 
-    let frame = NSRect::new(
-        NSPoint::new(payload.x, appkit_y),
-        NSSize::new(width, height),
-    );
+    let frame = NSRect::new(NSPoint::new(x, appkit_y), NSSize::new(width, height));
     let _: () = msg_send![native_view, setFrame: frame];
 
     let layer: cocoa_id = msg_send![native_view, layer];
     if !layer.is_null() {
-        let _: () = msg_send![layer, setContentsScale: payload.dpr];
+        let _: () = msg_send![layer, setContentsScale: dpr];
     }
 
     Ok(())
@@ -364,7 +386,7 @@ fn get_main_content_view_ptr(window: &WebviewWindow) -> Result<usize, String> {
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn get_content_view_height(content_view_ptr: usize) -> Result<f64, String> {
+unsafe fn get_content_view_size(content_view_ptr: usize) -> Result<(f64, f64), String> {
     use cocoa::{appkit::NSView, base::id as cocoa_id};
 
     let content_view = content_view_ptr as cocoa_id;
@@ -372,7 +394,8 @@ unsafe fn get_content_view_height(content_view_ptr: usize) -> Result<f64, String
         return Err("main content view is null".to_string());
     }
 
-    Ok(NSView::bounds(content_view).size.height)
+    let bounds = NSView::bounds(content_view);
+    Ok((bounds.size.width, bounds.size.height))
 }
 
 #[cfg(target_os = "macos")]
@@ -393,6 +416,121 @@ fn pixel_size(width: f64, height: f64, dpr: f64) -> (u32, u32) {
     let px_width = (width * dpr).round().max(1.0) as u32;
     let px_height = (height * dpr).round().max(1.0) as u32;
     (px_width, px_height)
+}
+
+#[cfg(target_os = "macos")]
+fn clamp01(value: f64) -> f64 {
+    value.clamp(0.0, 1.0)
+}
+
+#[cfg(target_os = "macos")]
+fn interpolate_anchor_position(
+    leading: f64,
+    trailing: f64,
+    size: f64,
+    old_viewport_size: f64,
+    new_viewport_size: f64,
+) -> f64 {
+    let old_available = (old_viewport_size - size).max(0.0);
+    let weight = if old_available > f64::EPSILON {
+        clamp01(leading / old_available)
+    } else {
+        0.5
+    };
+    let leading_position = leading;
+    let trailing_position = (new_viewport_size - trailing - size).max(0.0);
+
+    (leading_position * (1.0 - weight) + trailing_position * weight).max(0.0)
+}
+
+#[cfg(target_os = "macos")]
+fn estimate_slot_frame(
+    slot: &SlotEntry,
+    new_viewport_width: f64,
+    new_viewport_height: f64,
+) -> Option<EstimatedSlotFrame> {
+    if slot.viewport_logical_width <= 0.0 || slot.viewport_logical_height <= 0.0 {
+        return None;
+    }
+
+    let width = slot.logical_width.max(1.0);
+    let height = slot.logical_height.max(1.0);
+    let right = (slot.viewport_logical_width - slot.logical_x - width).max(0.0);
+    let bottom = (slot.viewport_logical_height - slot.logical_y - height).max(0.0);
+    let x = interpolate_anchor_position(
+        slot.logical_x,
+        right,
+        width,
+        slot.viewport_logical_width,
+        new_viewport_width,
+    );
+    let y = interpolate_anchor_position(
+        slot.logical_y,
+        bottom,
+        height,
+        slot.viewport_logical_height,
+        new_viewport_height,
+    );
+
+    Some(EstimatedSlotFrame {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn sync_estimated_overlay_frames(
+    window: &WebviewWindow,
+    inner: Arc<Mutex<WgpuSlotInnerState>>,
+) -> Result<(), String> {
+    let content_view_ptr = get_main_content_view_ptr(window)?;
+    let dpr = window
+        .scale_factor()
+        .map_err(|e| format!("failed to get window scale factor: {e}"))?;
+
+    run_on_main_thread_sync(window, move || {
+        let mut inner = inner
+            .lock()
+            .map_err(|_| "slot state lock poisoned".to_string())?;
+        let (content_width, content_height) = unsafe { get_content_view_size(content_view_ptr)? };
+        let _transaction = unsafe { NoAnimationTransaction::begin() };
+
+        for slot in inner.slots.values_mut() {
+            let Some(frame) = estimate_slot_frame(slot, content_width, content_height) else {
+                continue;
+            };
+
+            unsafe {
+                update_overlay_frame(
+                    slot.native_view_ptr,
+                    content_height,
+                    frame.x,
+                    frame.y,
+                    frame.width,
+                    frame.height,
+                    dpr,
+                )?;
+            }
+
+            if let Some(renderer) = slot.renderer.as_mut() {
+                let (px_width, px_height) = pixel_size(frame.width, frame.height, dpr);
+                if slot.last_pixel_width != px_width
+                    || slot.last_pixel_height != px_height
+                    || (slot.last_dpr - dpr).abs() > f64::EPSILON
+                {
+                    renderer.resize(frame.width, frame.height, dpr);
+                    slot.last_pixel_width = px_width;
+                    slot.last_pixel_height = px_height;
+                    slot.last_dpr = dpr;
+                }
+                renderer.render()?;
+            }
+        }
+
+        Ok(())
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -450,7 +588,7 @@ fn wgpu_slots_sync_batch(
             let mut inner = inner
                 .lock()
                 .map_err(|_| "slot state lock poisoned".to_string())?;
-            let content_height = unsafe { get_content_view_height(content_view_ptr)? };
+            let (_, content_height) = unsafe { get_content_view_size(content_view_ptr)? };
             let _transaction = unsafe { NoAnimationTransaction::begin() };
 
             for update in payload.updates {
@@ -485,6 +623,12 @@ fn wgpu_slots_sync_batch(
                                 last_pixel_width: 0,
                                 last_pixel_height: 0,
                                 last_dpr: 0.0,
+                                logical_x: update.logical_x,
+                                logical_y: update.logical_y,
+                                logical_width: update.logical_width,
+                                logical_height: update.logical_height,
+                                viewport_logical_width: update.viewport_logical_width,
+                                viewport_logical_height: update.viewport_logical_height,
                             },
                         );
                         native_view_ptr
@@ -498,10 +642,24 @@ fn wgpu_slots_sync_batch(
                         .ok_or_else(|| "slot should exist after create/update".to_string())?;
                     slot.z_index = update.z_index;
                     slot.paint_order = update.paint_order;
+                    slot.logical_x = update.logical_x;
+                    slot.logical_y = update.logical_y;
+                    slot.logical_width = update.logical_width;
+                    slot.logical_height = update.logical_height;
+                    slot.viewport_logical_width = update.viewport_logical_width;
+                    slot.viewport_logical_height = update.viewport_logical_height;
                 }
 
                 unsafe {
-                    update_overlay_frame(native_view_ptr, content_height, &update)?;
+                    update_overlay_frame(
+                        native_view_ptr,
+                        content_height,
+                        update.x,
+                        update.y,
+                        update.width,
+                        update.height,
+                        update.dpr,
+                    )?;
                 }
 
                 {
@@ -562,6 +720,32 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(WgpuSlotState::default())
+        .setup(|app| {
+            #[cfg(target_os = "macos")]
+            {
+                let window = app
+                    .get_webview_window("main")
+                    .ok_or_else(|| "main window was not found".to_string())?;
+                let inner = app.state::<WgpuSlotState>().inner.clone();
+                let event_window = window.clone();
+
+                window.on_window_event(move |event| {
+                    if !matches!(
+                        event,
+                        WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. }
+                    ) {
+                        return;
+                    }
+
+                    if let Err(error) = sync_estimated_overlay_frames(&event_window, inner.clone())
+                    {
+                        eprintln!("[tauri-wgpu] failed to estimate resize frames: {error}");
+                    }
+                });
+            }
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![wgpu_slots_sync_batch])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
