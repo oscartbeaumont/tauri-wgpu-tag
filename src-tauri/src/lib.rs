@@ -233,6 +233,7 @@ fn run_on_main_thread_sync<T: Send + 'static>(
 #[cfg(target_os = "macos")]
 unsafe fn create_overlay_view(content_view_ptr: usize) -> Result<usize, String> {
     use cocoa::{
+        appkit::{NSViewMaxXMargin, NSViewMinYMargin},
         base::{id as cocoa_id, NO},
         foundation::{NSPoint, NSRect, NSSize},
     };
@@ -278,6 +279,9 @@ unsafe fn create_overlay_view(content_view_ptr: usize) -> Result<usize, String> 
     let view: cocoa_id = msg_send![view_class, alloc];
     let view: cocoa_id = msg_send![view, initWithFrame: frame];
     let _: () = msg_send![view, setWantsLayer: cocoa::base::YES];
+    // Keep the overlay top-left anchored during AppKit live resize so it does not
+    // drift vertically before our explicit resize handler reapplies the frame.
+    let _: () = msg_send![view, setAutoresizingMask: NSViewMaxXMargin | NSViewMinYMargin];
 
     let layer: cocoa_id = msg_send![class!(CAMetalLayer), layer];
     let _: () = msg_send![view, setLayer: layer];
