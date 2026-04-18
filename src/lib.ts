@@ -21,15 +21,11 @@ type SlotSyncBatchPayload = {
 const TAG_NAME = "tauri-wgpu";
 const DIRTY_ELEMENTS = new Set<TauriWgpuElement>();
 const PENDING_UPDATES = new Map<string, SlotSyncUpdate>();
-const RESIZE_SYNC_WINDOW_MS = 150;
 
 let rafId: number | null = null;
 let syncInFlight = false;
-let globalListenersInstalled = false;
 let idCounter = 0;
 let frameSeq = 0;
-let resizeTrackingRafId: number | null = null;
-let resizeTrackingUntil = 0;
 
 const startupReady = new Promise<void>((resolve) => {
   const finish = () => {
@@ -62,11 +58,6 @@ function scheduleFlush(): void {
   });
 }
 
-function markDirty(element: TauriWgpuElement): void {
-  DIRTY_ELEMENTS.add(element);
-  scheduleFlush();
-}
-
 function getPaintOrderMap(): Map<string, number> {
   const map = new Map<string, number>();
   const elements = Array.from(document.querySelectorAll<TauriWgpuElement>(TAG_NAME));
@@ -84,32 +75,6 @@ function invalidateAll(): void {
   document
     .querySelectorAll<TauriWgpuElement>(TAG_NAME)
     .forEach((element) => DIRTY_ELEMENTS.add(element));
-}
-
-function trackActiveResizeFrame(): void {
-  resizeTrackingRafId = window.requestAnimationFrame(() => {
-    if (document.visibilityState !== "visible") {
-      resizeTrackingRafId = null;
-      return;
-    }
-
-    invalidateAll();
-    flushDirtyElements();
-
-    if (performance.now() < resizeTrackingUntil) {
-      trackActiveResizeFrame();
-      return;
-    }
-
-    resizeTrackingRafId = null;
-  });
-}
-
-function beginResizeTracking(): void {
-  resizeTrackingUntil = performance.now() + RESIZE_SYNC_WINDOW_MS;
-  if (resizeTrackingRafId === null) {
-    trackActiveResizeFrame();
-  }
 }
 
 async function sendSync(payload: SlotSyncBatchPayload): Promise<boolean> {
@@ -186,40 +151,59 @@ function flushDirtyElements(): void {
   void flushPendingUpdatesToNative();
 }
 
-function installGlobalListeners(): void {
-  if (globalListenersInstalled) {
-    return;
+class TauriWgpuElement extends HTMLElement {
+  static get observedAttributes(): string[] {
+    return ["x", "y", "width", "height", "z-index"];
   }
 
-  window.addEventListener("scroll", () => {
-    invalidateAll();
-    scheduleFlush();
-  }, { passive: true });
-  window.addEventListener("resize", () => {
-    invalidateAll();
-    scheduleFlush();
-    beginResizeTracking();
-  }, { passive: true });
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") {
-      invalidateAll();
-      flushDirtyElements();
-    }
-  });
-  globalListenersInstalled = true;
-}
-
-class TauriWgpuElement extends HTMLElement {
   public slotId = "";
 
   private mounted = false;
-  private resizeObserver: ResizeObserver | null = null;
-  private mutationObserver: MutationObserver | null = null;
   private slotSeq = 0;
 
   nextSlotSeq(): number {
     this.slotSeq += 1;
     return this.slotSeq;
+  }
+
+  attributeChangedCallback(name: string, oldValue: string | null, newValue: string | null): void {
+    if (oldValue === newValue) {
+      return;
+    }
+
+    this.applyViewportGeometry();
+
+    if (!this.mounted || !this.isConnected) {
+      return;
+    }
+
+    if (name === "z-index") {
+      invalidateAll();
+    } else {
+      DIRTY_ELEMENTS.add(this);
+    }
+
+    scheduleFlush();
+  }
+
+  private readNumberAttribute(name: string): number {
+    const value = this.getAttribute(name);
+    if (value === null) {
+      return 0;
+    }
+
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  private applyViewportGeometry(): void {
+    this.style.position = "fixed";
+    this.style.left = `${this.readNumberAttribute("x")}px`;
+    this.style.top = `${this.readNumberAttribute("y")}px`;
+    this.style.width = `${Math.max(1, this.readNumberAttribute("width"))}px`;
+    this.style.height = `${Math.max(1, this.readNumberAttribute("height"))}px`;
+    this.style.zIndex = `${toNumber(this.getAttribute("z-index") ?? "0")}`;
+    this.style.display = "block";
   }
 
   connectedCallback(): void {
@@ -229,22 +213,17 @@ class TauriWgpuElement extends HTMLElement {
       this.dataset.slotId = this.slotId;
     }
 
-    if (!this.style.display) {
-      this.style.display = "block";
-    }
-
+    this.applyViewportGeometry();
     this.mounted = true;
-    installGlobalListeners();
-    this.setupObservers();
-    markDirty(this);
-    window.setTimeout(() => markDirty(this), 250);
-    window.setTimeout(() => markDirty(this), 1000);
+    invalidateAll();
+    scheduleFlush();
   }
 
   disconnectedCallback(): void {
     this.mounted = false;
     DIRTY_ELEMENTS.delete(this);
-    this.cleanupObservers();
+    invalidateAll();
+    scheduleFlush();
 
     const payload: SlotSyncUpdate = {
       id: this.slotId,
@@ -262,46 +241,25 @@ class TauriWgpuElement extends HTMLElement {
     enqueueUpdate(payload);
   }
 
-  setupObservers(): void {
-    if (!this.resizeObserver) {
-      this.resizeObserver = new ResizeObserver(() => markDirty(this));
-      this.resizeObserver.observe(this);
-    }
-
-    if (!this.mutationObserver) {
-      this.mutationObserver = new MutationObserver(() => markDirty(this));
-      this.mutationObserver.observe(this, {
-        attributes: true,
-        attributeFilter: ["style", "class"],
-      });
-    }
-  }
-
-  cleanupObservers(): void {
-    this.resizeObserver?.disconnect();
-    this.resizeObserver = null;
-
-    this.mutationObserver?.disconnect();
-    this.mutationObserver = null;
-  }
-
   flushSync(paintOrderMap: Map<string, number>): void {
     if (!this.mounted || !this.isConnected) {
       return;
     }
 
-    const rect = this.getBoundingClientRect();
-    const style = window.getComputedStyle(this);
-    const zIndex = toNumber(style.zIndex);
+    const x = this.readNumberAttribute("x");
+    const y = this.readNumberAttribute("y");
+    const width = Math.max(1, this.readNumberAttribute("width"));
+    const height = Math.max(1, this.readNumberAttribute("height"));
+    const zIndex = toNumber(this.getAttribute("z-index") ?? "0");
     const paintOrder = paintOrderMap.get(this.slotId) ?? 0;
 
     const payload: SlotSyncUpdate = {
       id: this.slotId,
       mounted: true,
-      x: rect.left,
-      y: rect.top,
-      width: rect.width,
-      height: rect.height,
+      x,
+      y,
+      width,
+      height,
       dpr: window.devicePixelRatio || 1,
       zIndex,
       paintOrder,

@@ -49,31 +49,10 @@ struct SlotEntry {
     last_pixel_width: u32,
     last_pixel_height: u32,
     last_dpr: f64,
-    reference_content_width: f64,
-    reference_content_height: f64,
-    reference_x: f64,
-    reference_y: f64,
-    reference_width: f64,
-    reference_height: f64,
-    horizontal_anchor: AnchorMode,
-    vertical_anchor: AnchorMode,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy)]
-struct EstimatedSlotFrame {
     x: f64,
     y: f64,
     width: f64,
     height: f64,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy)]
-enum AnchorMode {
-    Leading,
-    Center,
-    Trailing,
 }
 
 #[cfg(target_os = "macos")]
@@ -423,110 +402,6 @@ fn pixel_size(width: f64, height: f64, dpr: f64) -> (u32, u32) {
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_anchor_mode(leading: f64, trailing: f64) -> AnchorMode {
-    let delta = (leading - trailing).abs();
-    if delta <= 24.0 {
-        AnchorMode::Center
-    } else if leading < trailing {
-        AnchorMode::Leading
-    } else {
-        AnchorMode::Trailing
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn clamp_position(position: f64, size: f64, viewport_size: f64) -> f64 {
-    let max_position = (viewport_size - size).max(0.0);
-    position.clamp(0.0, max_position)
-}
-
-#[cfg(target_os = "macos")]
-fn estimate_axis_position(
-    anchor: AnchorMode,
-    reference_position: f64,
-    size: f64,
-    old_viewport_size: f64,
-    new_viewport_size: f64,
-) -> f64 {
-    let trailing = (old_viewport_size - reference_position - size).max(0.0);
-    let position = match anchor {
-        AnchorMode::Leading => reference_position,
-        AnchorMode::Center => reference_position + (new_viewport_size - old_viewport_size) / 2.0,
-        AnchorMode::Trailing => new_viewport_size - trailing - size,
-    };
-
-    clamp_position(position, size, new_viewport_size)
-}
-
-#[cfg(target_os = "macos")]
-fn estimate_slot_frame(
-    slot: &SlotEntry,
-    new_viewport_width: f64,
-    new_viewport_height: f64,
-) -> Option<EstimatedSlotFrame> {
-    if slot.reference_content_width <= 0.0 || slot.reference_content_height <= 0.0 {
-        return None;
-    }
-
-    let width = slot.reference_width.max(1.0);
-    let height = slot.reference_height.max(1.0);
-    let width_changed = (new_viewport_width - slot.reference_content_width).abs() > f64::EPSILON;
-    let height_changed = (new_viewport_height - slot.reference_content_height).abs() > f64::EPSILON;
-
-    let x = if width_changed {
-        estimate_axis_position(
-            slot.horizontal_anchor,
-            slot.reference_x,
-            width,
-            slot.reference_content_width,
-            new_viewport_width,
-        )
-    } else {
-        slot.reference_x
-    };
-    let y = if height_changed {
-        estimate_axis_position(
-            slot.vertical_anchor,
-            slot.reference_y,
-            height,
-            slot.reference_content_height,
-            new_viewport_height,
-        )
-    } else {
-        slot.reference_y
-    };
-
-    Some(EstimatedSlotFrame {
-        x,
-        y,
-        width,
-        height,
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn update_slot_reference_frame(
-    slot: &mut SlotEntry,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    content_width: f64,
-    content_height: f64,
-) {
-    let right = (content_width - x - width).max(0.0);
-    let bottom = (content_height - y - height).max(0.0);
-    slot.reference_content_width = content_width;
-    slot.reference_content_height = content_height;
-    slot.reference_x = x;
-    slot.reference_y = y;
-    slot.reference_width = width;
-    slot.reference_height = height;
-    slot.horizontal_anchor = resolve_anchor_mode(x, right);
-    slot.vertical_anchor = resolve_anchor_mode(y, bottom);
-}
-
-#[cfg(target_os = "macos")]
 fn sync_estimated_overlay_frames(
     window: &WebviewWindow,
     inner: Arc<Mutex<WgpuSlotInnerState>>,
@@ -540,33 +415,29 @@ fn sync_estimated_overlay_frames(
         let mut inner = inner
             .lock()
             .map_err(|_| "slot state lock poisoned".to_string())?;
-        let (content_width, content_height) = unsafe { get_content_view_size(content_view_ptr)? };
+        let (_, content_height) = unsafe { get_content_view_size(content_view_ptr)? };
         let _transaction = unsafe { NoAnimationTransaction::begin() };
 
         for slot in inner.slots.values_mut() {
-            let Some(frame) = estimate_slot_frame(slot, content_width, content_height) else {
-                continue;
-            };
-
             unsafe {
                 update_overlay_frame(
                     slot.native_view_ptr,
                     content_height,
-                    frame.x,
-                    frame.y,
-                    frame.width,
-                    frame.height,
+                    slot.x,
+                    slot.y,
+                    slot.width,
+                    slot.height,
                     dpr,
                 )?;
             }
 
             if let Some(renderer) = slot.renderer.as_mut() {
-                let (px_width, px_height) = pixel_size(frame.width, frame.height, dpr);
+                let (px_width, px_height) = pixel_size(slot.width, slot.height, dpr);
                 if slot.last_pixel_width != px_width
                     || slot.last_pixel_height != px_height
                     || (slot.last_dpr - dpr).abs() > f64::EPSILON
                 {
-                    renderer.resize(frame.width, frame.height, dpr);
+                    renderer.resize(slot.width, slot.height, dpr);
                     slot.last_pixel_width = px_width;
                     slot.last_pixel_height = px_height;
                     slot.last_dpr = dpr;
@@ -634,8 +505,7 @@ fn wgpu_slots_sync_batch(
             let mut inner = inner
                 .lock()
                 .map_err(|_| "slot state lock poisoned".to_string())?;
-            let (content_width, content_height) =
-                unsafe { get_content_view_size(content_view_ptr)? };
+            let (_, content_height) = unsafe { get_content_view_size(content_view_ptr)? };
             let _transaction = unsafe { NoAnimationTransaction::begin() };
 
             for update in payload.updates {
@@ -670,14 +540,10 @@ fn wgpu_slots_sync_batch(
                                 last_pixel_width: 0,
                                 last_pixel_height: 0,
                                 last_dpr: 0.0,
-                                reference_content_width: content_width,
-                                reference_content_height: content_height,
-                                reference_x: update.x,
-                                reference_y: update.y,
-                                reference_width: update.width,
-                                reference_height: update.height,
-                                horizontal_anchor: AnchorMode::Leading,
-                                vertical_anchor: AnchorMode::Leading,
+                                x: update.x,
+                                y: update.y,
+                                width: update.width,
+                                height: update.height,
                             },
                         );
                         native_view_ptr
@@ -691,15 +557,10 @@ fn wgpu_slots_sync_batch(
                         .ok_or_else(|| "slot should exist after create/update".to_string())?;
                     slot.z_index = update.z_index;
                     slot.paint_order = update.paint_order;
-                    update_slot_reference_frame(
-                        slot,
-                        update.x,
-                        update.y,
-                        update.width,
-                        update.height,
-                        content_width,
-                        content_height,
-                    );
+                    slot.x = update.x;
+                    slot.y = update.y;
+                    slot.width = update.width;
+                    slot.height = update.height;
                 }
 
                 unsafe {

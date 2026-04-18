@@ -35,7 +35,7 @@ p {
 .playground {
   position: relative;
   margin-top: 22px;
-  min-height: 360px;
+  height: 360px;
   border-radius: 20px;
   border: 1px solid rgba(22, 40, 64, 0.2);
   background: linear-gradient(165deg, rgba(255, 255, 255, 0.88), rgba(236, 243, 255, 0.75));
@@ -44,32 +44,7 @@ p {
 }
 
 .slot {
-  position: absolute;
   border-radius: 12px;
-}
-
-.slot-a {
-  left: 64px;
-  top: 64px;
-  width: 260px;
-  height: 170px;
-  z-index: 1;
-}
-
-.slot-b {
-  left: 170px;
-  top: 132px;
-  width: 280px;
-  height: 170px;
-  z-index: 3;
-}
-
-.slot-c {
-  left: 310px;
-  top: 52px;
-  width: 230px;
-  height: 138px;
-  z-index: 5;
 }
 
 .hud {
