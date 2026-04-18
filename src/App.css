@@ -44,6 +44,8 @@ p {
 }
 
 .slot {
+  background: rgba(0, 200, 0, 0.55);
+  border: 5px solid #ff0000;
   border-radius: 12px;
 }
 
