@@ -21,12 +21,15 @@ type SlotSyncBatchPayload = {
 const TAG_NAME = "tauri-wgpu";
 const DIRTY_ELEMENTS = new Set<TauriWgpuElement>();
 const PENDING_UPDATES = new Map<string, SlotSyncUpdate>();
+const RESIZE_SYNC_WINDOW_MS = 150;
 
 let rafId: number | null = null;
 let syncInFlight = false;
 let globalListenersInstalled = false;
 let idCounter = 0;
 let frameSeq = 0;
+let resizeTrackingRafId: number | null = null;
+let resizeTrackingUntil = 0;
 
 const startupReady = new Promise<void>((resolve) => {
   const finish = () => {
@@ -75,6 +78,38 @@ function getPaintOrderMap(): Map<string, number> {
   });
 
   return map;
+}
+
+function invalidateAll(): void {
+  document
+    .querySelectorAll<TauriWgpuElement>(TAG_NAME)
+    .forEach((element) => DIRTY_ELEMENTS.add(element));
+}
+
+function trackActiveResizeFrame(): void {
+  resizeTrackingRafId = window.requestAnimationFrame(() => {
+    if (document.visibilityState !== "visible") {
+      resizeTrackingRafId = null;
+      return;
+    }
+
+    invalidateAll();
+    flushDirtyElements();
+
+    if (performance.now() < resizeTrackingUntil) {
+      trackActiveResizeFrame();
+      return;
+    }
+
+    resizeTrackingRafId = null;
+  });
+}
+
+function beginResizeTracking(): void {
+  resizeTrackingUntil = performance.now() + RESIZE_SYNC_WINDOW_MS;
+  if (resizeTrackingRafId === null) {
+    trackActiveResizeFrame();
+  }
 }
 
 async function sendSync(payload: SlotSyncBatchPayload): Promise<boolean> {
@@ -156,18 +191,19 @@ function installGlobalListeners(): void {
     return;
   }
 
-  const invalidateAll = (): void => {
-    document
-      .querySelectorAll<TauriWgpuElement>(TAG_NAME)
-      .forEach((element) => markDirty(element));
-  };
-
-  window.addEventListener("scroll", invalidateAll, { passive: true });
-  window.addEventListener("resize", invalidateAll, { passive: true });
+  window.addEventListener("scroll", () => {
+    invalidateAll();
+    scheduleFlush();
+  }, { passive: true });
+  window.addEventListener("resize", () => {
+    invalidateAll();
+    scheduleFlush();
+    beginResizeTracking();
+  }, { passive: true });
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
       invalidateAll();
-      void flushPendingUpdatesToNative();
+      flushDirtyElements();
     }
   });
   globalListenersInstalled = true;
