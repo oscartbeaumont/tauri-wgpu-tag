@@ -61,6 +61,12 @@ struct SlotEntry {
     logical_height: f64,
     viewport_logical_width: f64,
     viewport_logical_height: f64,
+    last_native_content_width: f64,
+    last_native_content_height: f64,
+    last_applied_x: f64,
+    last_applied_y: f64,
+    last_applied_width: f64,
+    last_applied_height: f64,
 }
 
 #[cfg(target_os = "macos")]
@@ -424,7 +430,7 @@ fn clamp01(value: f64) -> f64 {
 }
 
 #[cfg(target_os = "macos")]
-fn interpolate_anchor_position(
+fn estimate_axis_position(
     leading: f64,
     trailing: f64,
     size: f64,
@@ -432,15 +438,21 @@ fn interpolate_anchor_position(
     new_viewport_size: f64,
 ) -> f64 {
     let old_available = (old_viewport_size - size).max(0.0);
-    let weight = if old_available > f64::EPSILON {
-        clamp01(leading / old_available)
-    } else {
-        0.5
-    };
-    let leading_position = leading;
-    let trailing_position = (new_viewport_size - trailing - size).max(0.0);
+    if old_available <= f64::EPSILON {
+        return 0.0;
+    }
 
-    (leading_position * (1.0 - weight) + trailing_position * weight).max(0.0)
+    let normalized_position = clamp01(leading / old_available);
+    let center_band = 0.18;
+    if (normalized_position - 0.5).abs() <= center_band {
+        return (leading + (new_viewport_size - old_viewport_size) / 2.0).max(0.0);
+    }
+
+    if normalized_position < 0.5 {
+        leading.max(0.0)
+    } else {
+        (new_viewport_size - trailing - size).max(0.0)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -449,28 +461,40 @@ fn estimate_slot_frame(
     new_viewport_width: f64,
     new_viewport_height: f64,
 ) -> Option<EstimatedSlotFrame> {
-    if slot.viewport_logical_width <= 0.0 || slot.viewport_logical_height <= 0.0 {
+    if slot.last_native_content_width <= 0.0 || slot.last_native_content_height <= 0.0 {
         return None;
     }
 
-    let width = slot.logical_width.max(1.0);
-    let height = slot.logical_height.max(1.0);
-    let right = (slot.viewport_logical_width - slot.logical_x - width).max(0.0);
-    let bottom = (slot.viewport_logical_height - slot.logical_y - height).max(0.0);
-    let x = interpolate_anchor_position(
-        slot.logical_x,
-        right,
-        width,
-        slot.viewport_logical_width,
-        new_viewport_width,
-    );
-    let y = interpolate_anchor_position(
-        slot.logical_y,
-        bottom,
-        height,
-        slot.viewport_logical_height,
-        new_viewport_height,
-    );
+    let width = slot.last_applied_width.max(1.0);
+    let height = slot.last_applied_height.max(1.0);
+    let width_changed = (new_viewport_width - slot.last_native_content_width).abs() > f64::EPSILON;
+    let height_changed =
+        (new_viewport_height - slot.last_native_content_height).abs() > f64::EPSILON;
+    let right = (slot.last_native_content_width - slot.last_applied_x - width).max(0.0);
+    let bottom = (slot.last_native_content_height - slot.last_applied_y - height).max(0.0);
+
+    let x = if width_changed {
+        estimate_axis_position(
+            slot.last_applied_x,
+            right,
+            width,
+            slot.last_native_content_width,
+            new_viewport_width,
+        )
+    } else {
+        slot.last_applied_x
+    };
+    let y = if height_changed {
+        estimate_axis_position(
+            slot.last_applied_y,
+            bottom,
+            height,
+            slot.last_native_content_height,
+            new_viewport_height,
+        )
+    } else {
+        slot.last_applied_y
+    };
 
     Some(EstimatedSlotFrame {
         x,
@@ -478,6 +502,24 @@ fn estimate_slot_frame(
         width,
         height,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn update_cached_applied_frame(
+    slot: &mut SlotEntry,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    content_width: f64,
+    content_height: f64,
+) {
+    slot.last_native_content_width = content_width;
+    slot.last_native_content_height = content_height;
+    slot.last_applied_x = x;
+    slot.last_applied_y = y;
+    slot.last_applied_width = width;
+    slot.last_applied_height = height;
 }
 
 #[cfg(target_os = "macos")]
@@ -527,6 +569,16 @@ fn sync_estimated_overlay_frames(
                 }
                 renderer.render()?;
             }
+
+            update_cached_applied_frame(
+                slot,
+                frame.x,
+                frame.y,
+                frame.width,
+                frame.height,
+                content_width,
+                content_height,
+            );
         }
 
         Ok(())
@@ -588,7 +640,8 @@ fn wgpu_slots_sync_batch(
             let mut inner = inner
                 .lock()
                 .map_err(|_| "slot state lock poisoned".to_string())?;
-            let (_, content_height) = unsafe { get_content_view_size(content_view_ptr)? };
+            let (content_width, content_height) =
+                unsafe { get_content_view_size(content_view_ptr)? };
             let _transaction = unsafe { NoAnimationTransaction::begin() };
 
             for update in payload.updates {
@@ -629,6 +682,12 @@ fn wgpu_slots_sync_batch(
                                 logical_height: update.logical_height,
                                 viewport_logical_width: update.viewport_logical_width,
                                 viewport_logical_height: update.viewport_logical_height,
+                                last_native_content_width: content_width,
+                                last_native_content_height: content_height,
+                                last_applied_x: update.x,
+                                last_applied_y: update.y,
+                                last_applied_width: update.width,
+                                last_applied_height: update.height,
                             },
                         );
                         native_view_ptr
@@ -648,6 +707,15 @@ fn wgpu_slots_sync_batch(
                     slot.logical_height = update.logical_height;
                     slot.viewport_logical_width = update.viewport_logical_width;
                     slot.viewport_logical_height = update.viewport_logical_height;
+                    update_cached_applied_frame(
+                        slot,
+                        update.x,
+                        update.y,
+                        update.width,
+                        update.height,
+                        content_width,
+                        content_height,
+                    );
                 }
 
                 unsafe {
