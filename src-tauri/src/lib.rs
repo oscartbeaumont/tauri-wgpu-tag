@@ -14,12 +14,6 @@ struct WgpuSlotSyncPayload {
     y: f64,
     width: f64,
     height: f64,
-    logical_x: f64,
-    logical_y: f64,
-    logical_width: f64,
-    logical_height: f64,
-    viewport_logical_width: f64,
-    viewport_logical_height: f64,
     dpr: f64,
     z_index: i64,
     paint_order: i64,
@@ -55,18 +49,14 @@ struct SlotEntry {
     last_pixel_width: u32,
     last_pixel_height: u32,
     last_dpr: f64,
-    logical_x: f64,
-    logical_y: f64,
-    logical_width: f64,
-    logical_height: f64,
-    viewport_logical_width: f64,
-    viewport_logical_height: f64,
-    last_native_content_width: f64,
-    last_native_content_height: f64,
-    last_applied_x: f64,
-    last_applied_y: f64,
-    last_applied_width: f64,
-    last_applied_height: f64,
+    reference_content_width: f64,
+    reference_content_height: f64,
+    reference_x: f64,
+    reference_y: f64,
+    reference_width: f64,
+    reference_height: f64,
+    horizontal_anchor: AnchorMode,
+    vertical_anchor: AnchorMode,
 }
 
 #[cfg(target_os = "macos")]
@@ -76,6 +66,14 @@ struct EstimatedSlotFrame {
     y: f64,
     width: f64,
     height: f64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum AnchorMode {
+    Leading,
+    Center,
+    Trailing,
 }
 
 #[cfg(target_os = "macos")]
@@ -425,34 +423,39 @@ fn pixel_size(width: f64, height: f64, dpr: f64) -> (u32, u32) {
 }
 
 #[cfg(target_os = "macos")]
-fn clamp01(value: f64) -> f64 {
-    value.clamp(0.0, 1.0)
+fn resolve_anchor_mode(leading: f64, trailing: f64) -> AnchorMode {
+    let delta = (leading - trailing).abs();
+    if delta <= 24.0 {
+        AnchorMode::Center
+    } else if leading < trailing {
+        AnchorMode::Leading
+    } else {
+        AnchorMode::Trailing
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clamp_position(position: f64, size: f64, viewport_size: f64) -> f64 {
+    let max_position = (viewport_size - size).max(0.0);
+    position.clamp(0.0, max_position)
 }
 
 #[cfg(target_os = "macos")]
 fn estimate_axis_position(
-    leading: f64,
-    trailing: f64,
+    anchor: AnchorMode,
+    reference_position: f64,
     size: f64,
     old_viewport_size: f64,
     new_viewport_size: f64,
 ) -> f64 {
-    let old_available = (old_viewport_size - size).max(0.0);
-    if old_available <= f64::EPSILON {
-        return 0.0;
-    }
+    let trailing = (old_viewport_size - reference_position - size).max(0.0);
+    let position = match anchor {
+        AnchorMode::Leading => reference_position,
+        AnchorMode::Center => reference_position + (new_viewport_size - old_viewport_size) / 2.0,
+        AnchorMode::Trailing => new_viewport_size - trailing - size,
+    };
 
-    let normalized_position = clamp01(leading / old_available);
-    let center_band = 0.18;
-    if (normalized_position - 0.5).abs() <= center_band {
-        return (leading + (new_viewport_size - old_viewport_size) / 2.0).max(0.0);
-    }
-
-    if normalized_position < 0.5 {
-        leading.max(0.0)
-    } else {
-        (new_viewport_size - trailing - size).max(0.0)
-    }
+    clamp_position(position, size, new_viewport_size)
 }
 
 #[cfg(target_os = "macos")]
@@ -461,39 +464,36 @@ fn estimate_slot_frame(
     new_viewport_width: f64,
     new_viewport_height: f64,
 ) -> Option<EstimatedSlotFrame> {
-    if slot.last_native_content_width <= 0.0 || slot.last_native_content_height <= 0.0 {
+    if slot.reference_content_width <= 0.0 || slot.reference_content_height <= 0.0 {
         return None;
     }
 
-    let width = slot.last_applied_width.max(1.0);
-    let height = slot.last_applied_height.max(1.0);
-    let width_changed = (new_viewport_width - slot.last_native_content_width).abs() > f64::EPSILON;
-    let height_changed =
-        (new_viewport_height - slot.last_native_content_height).abs() > f64::EPSILON;
-    let right = (slot.last_native_content_width - slot.last_applied_x - width).max(0.0);
-    let bottom = (slot.last_native_content_height - slot.last_applied_y - height).max(0.0);
+    let width = slot.reference_width.max(1.0);
+    let height = slot.reference_height.max(1.0);
+    let width_changed = (new_viewport_width - slot.reference_content_width).abs() > f64::EPSILON;
+    let height_changed = (new_viewport_height - slot.reference_content_height).abs() > f64::EPSILON;
 
     let x = if width_changed {
         estimate_axis_position(
-            slot.last_applied_x,
-            right,
+            slot.horizontal_anchor,
+            slot.reference_x,
             width,
-            slot.last_native_content_width,
+            slot.reference_content_width,
             new_viewport_width,
         )
     } else {
-        slot.last_applied_x
+        slot.reference_x
     };
     let y = if height_changed {
         estimate_axis_position(
-            slot.last_applied_y,
-            bottom,
+            slot.vertical_anchor,
+            slot.reference_y,
             height,
-            slot.last_native_content_height,
+            slot.reference_content_height,
             new_viewport_height,
         )
     } else {
-        slot.last_applied_y
+        slot.reference_y
     };
 
     Some(EstimatedSlotFrame {
@@ -505,7 +505,7 @@ fn estimate_slot_frame(
 }
 
 #[cfg(target_os = "macos")]
-fn update_cached_applied_frame(
+fn update_slot_reference_frame(
     slot: &mut SlotEntry,
     x: f64,
     y: f64,
@@ -514,12 +514,16 @@ fn update_cached_applied_frame(
     content_width: f64,
     content_height: f64,
 ) {
-    slot.last_native_content_width = content_width;
-    slot.last_native_content_height = content_height;
-    slot.last_applied_x = x;
-    slot.last_applied_y = y;
-    slot.last_applied_width = width;
-    slot.last_applied_height = height;
+    let right = (content_width - x - width).max(0.0);
+    let bottom = (content_height - y - height).max(0.0);
+    slot.reference_content_width = content_width;
+    slot.reference_content_height = content_height;
+    slot.reference_x = x;
+    slot.reference_y = y;
+    slot.reference_width = width;
+    slot.reference_height = height;
+    slot.horizontal_anchor = resolve_anchor_mode(x, right);
+    slot.vertical_anchor = resolve_anchor_mode(y, bottom);
 }
 
 #[cfg(target_os = "macos")]
@@ -569,16 +573,6 @@ fn sync_estimated_overlay_frames(
                 }
                 renderer.render()?;
             }
-
-            update_cached_applied_frame(
-                slot,
-                frame.x,
-                frame.y,
-                frame.width,
-                frame.height,
-                content_width,
-                content_height,
-            );
         }
 
         Ok(())
@@ -676,18 +670,14 @@ fn wgpu_slots_sync_batch(
                                 last_pixel_width: 0,
                                 last_pixel_height: 0,
                                 last_dpr: 0.0,
-                                logical_x: update.logical_x,
-                                logical_y: update.logical_y,
-                                logical_width: update.logical_width,
-                                logical_height: update.logical_height,
-                                viewport_logical_width: update.viewport_logical_width,
-                                viewport_logical_height: update.viewport_logical_height,
-                                last_native_content_width: content_width,
-                                last_native_content_height: content_height,
-                                last_applied_x: update.x,
-                                last_applied_y: update.y,
-                                last_applied_width: update.width,
-                                last_applied_height: update.height,
+                                reference_content_width: content_width,
+                                reference_content_height: content_height,
+                                reference_x: update.x,
+                                reference_y: update.y,
+                                reference_width: update.width,
+                                reference_height: update.height,
+                                horizontal_anchor: AnchorMode::Leading,
+                                vertical_anchor: AnchorMode::Leading,
                             },
                         );
                         native_view_ptr
@@ -701,13 +691,7 @@ fn wgpu_slots_sync_batch(
                         .ok_or_else(|| "slot should exist after create/update".to_string())?;
                     slot.z_index = update.z_index;
                     slot.paint_order = update.paint_order;
-                    slot.logical_x = update.logical_x;
-                    slot.logical_y = update.logical_y;
-                    slot.logical_width = update.logical_width;
-                    slot.logical_height = update.logical_height;
-                    slot.viewport_logical_width = update.viewport_logical_width;
-                    slot.viewport_logical_height = update.viewport_logical_height;
-                    update_cached_applied_frame(
+                    update_slot_reference_frame(
                         slot,
                         update.x,
                         update.y,
