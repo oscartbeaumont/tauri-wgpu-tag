@@ -231,10 +231,10 @@ fn run_on_main_thread_sync<T: Send + 'static>(
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn create_overlay_view(content_view_ptr: usize) -> Result<usize, String> {
+unsafe fn create_overlay_view(overlay_host_ptr: usize) -> Result<usize, String> {
     use cocoa::{
         appkit::{NSViewMaxXMargin, NSViewMinYMargin},
-        base::{id as cocoa_id, NO},
+        base::{id as cocoa_id, NO, YES},
         foundation::{NSPoint, NSRect, NSSize},
     };
     use objc::{class, msg_send, runtime::Class, sel, sel_impl};
@@ -269,9 +269,9 @@ unsafe fn create_overlay_view(content_view_ptr: usize) -> Result<usize, String> 
         })
     }
 
-    let content_view = content_view_ptr as cocoa_id;
-    if content_view.is_null() {
-        return Err("main content view is null".to_string());
+    let overlay_host = overlay_host_ptr as cocoa_id;
+    if overlay_host.is_null() {
+        return Err("overlay host view is null".to_string());
     }
 
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0));
@@ -284,19 +284,21 @@ unsafe fn create_overlay_view(content_view_ptr: usize) -> Result<usize, String> 
     let _: () = msg_send![view, setAutoresizingMask: NSViewMaxXMargin | NSViewMinYMargin];
 
     let layer: cocoa_id = msg_send![class!(CAMetalLayer), layer];
+    let _: () = msg_send![layer, setCornerRadius: 12.0f64];
+    let _: () = msg_send![layer, setMasksToBounds: YES];
     let _: () = msg_send![view, setLayer: layer];
     let _: () = msg_send![view, setHidden: NO];
 
-    let _: () = msg_send![content_view, addSubview: view];
+    let _: () = msg_send![overlay_host, addSubview: view];
     Ok(view as usize)
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn remove_overlay_view(content_view_ptr: usize, native_view_ptr: usize) {
+unsafe fn remove_overlay_view(overlay_host_ptr: usize, native_view_ptr: usize) {
     use cocoa::base::id as cocoa_id;
     use objc::{msg_send, sel, sel_impl};
 
-    let _ = content_view_ptr;
+    let _ = overlay_host_ptr;
     let native_view = native_view_ptr as cocoa_id;
     if !native_view.is_null() {
         let _: () = msg_send![native_view, removeFromSuperview];
@@ -305,8 +307,9 @@ unsafe fn remove_overlay_view(content_view_ptr: usize, native_view_ptr: usize) {
 
 #[cfg(target_os = "macos")]
 unsafe fn update_overlay_frame(
+    viewport_view_ptr: usize,
+    overlay_host_ptr: usize,
     native_view_ptr: usize,
-    content_height: f64,
     x: f64,
     y: f64,
     width: f64,
@@ -314,6 +317,7 @@ unsafe fn update_overlay_frame(
     dpr: f64,
 ) -> Result<(), String> {
     use cocoa::{
+        appkit::NSView,
         base::id as cocoa_id,
         foundation::{NSPoint, NSRect, NSSize},
     };
@@ -326,13 +330,22 @@ unsafe fn update_overlay_frame(
 
     let width = width.max(1.0);
     let height = height.max(1.0);
-    let appkit_y = content_height - y - height;
+    let (_, viewport_height) = unsafe { get_view_size(viewport_view_ptr)? };
+    let viewport_y = if unsafe { is_view_flipped(viewport_view_ptr)? } {
+        y
+    } else {
+        viewport_height - y - height
+    };
 
-    let frame = NSRect::new(NSPoint::new(x, appkit_y), NSSize::new(width, height));
+    let viewport_frame = NSRect::new(NSPoint::new(x, viewport_y), NSSize::new(width, height));
+    let frame =
+        unsafe { convert_rect_between_views(viewport_view_ptr, overlay_host_ptr, viewport_frame)? };
     let _: () = msg_send![native_view, setFrame: frame];
 
     let layer: cocoa_id = msg_send![native_view, layer];
     if !layer.is_null() {
+        let bounds = NSView::bounds(native_view);
+        let _: () = msg_send![layer, setFrame: bounds];
         let _: () = msg_send![layer, setContentsScale: dpr];
     }
 
@@ -340,16 +353,68 @@ unsafe fn update_overlay_frame(
 }
 
 #[cfg(target_os = "macos")]
+unsafe fn is_view_flipped(view_ptr: usize) -> Result<bool, String> {
+    use cocoa::base::id as cocoa_id;
+    use objc::{msg_send, sel, sel_impl};
+
+    let view = view_ptr as cocoa_id;
+    if view.is_null() {
+        return Err("native view not found".to_string());
+    }
+
+    let flipped: bool = msg_send![view, isFlipped];
+    Ok(flipped)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn get_superview_ptr(view_ptr: usize) -> Result<Option<usize>, String> {
+    use cocoa::base::id as cocoa_id;
+    use objc::{msg_send, sel, sel_impl};
+
+    let view = view_ptr as cocoa_id;
+    if view.is_null() {
+        return Err("native view not found".to_string());
+    }
+
+    let superview: cocoa_id = msg_send![view, superview];
+    if superview.is_null() {
+        return Ok(None);
+    }
+
+    Ok(Some(superview as usize))
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn convert_rect_between_views(
+    from_view_ptr: usize,
+    to_view_ptr: usize,
+    rect: cocoa::foundation::NSRect,
+) -> Result<cocoa::foundation::NSRect, String> {
+    use cocoa::base::id as cocoa_id;
+    use objc::{msg_send, sel, sel_impl};
+
+    let from_view = from_view_ptr as cocoa_id;
+    let to_view = to_view_ptr as cocoa_id;
+    if from_view.is_null() || to_view.is_null() {
+        return Err("source or destination view is null".to_string());
+    }
+
+    let converted: cocoa::foundation::NSRect =
+        msg_send![from_view, convertRect: rect toView: to_view];
+    Ok(converted)
+}
+
+#[cfg(target_os = "macos")]
 unsafe fn reorder_overlay_views(
-    content_view_ptr: usize,
+    overlay_host_ptr: usize,
     native_view_ptrs: &[usize],
 ) -> Result<(), String> {
     use cocoa::base::id as cocoa_id;
     use objc::{msg_send, sel, sel_impl};
 
-    let content_view = content_view_ptr as cocoa_id;
-    if content_view.is_null() {
-        return Err("main content view is null".to_string());
+    let overlay_host = overlay_host_ptr as cocoa_id;
+    if overlay_host.is_null() {
+        return Err("overlay host view is null".to_string());
     }
 
     for ptr in native_view_ptrs {
@@ -358,30 +423,30 @@ unsafe fn reorder_overlay_views(
             continue;
         }
         let _: () = msg_send![view, removeFromSuperview];
-        let _: () = msg_send![content_view, addSubview: view];
+        let _: () = msg_send![overlay_host, addSubview: view];
     }
 
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn get_main_content_view_ptr(window: &WebviewWindow) -> Result<usize, String> {
+fn get_viewport_view_ptr(window: &WebviewWindow) -> Result<usize, String> {
     window
         .ns_view()
         .map(|ptr| ptr as usize)
-        .map_err(|e| format!("failed to get main content view: {e}"))
+        .map_err(|e| format!("failed to get viewport view: {e}"))
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn get_content_view_size(content_view_ptr: usize) -> Result<(f64, f64), String> {
+unsafe fn get_view_size(view_ptr: usize) -> Result<(f64, f64), String> {
     use cocoa::{appkit::NSView, base::id as cocoa_id};
 
-    let content_view = content_view_ptr as cocoa_id;
-    if content_view.is_null() {
-        return Err("main content view is null".to_string());
+    let view = view_ptr as cocoa_id;
+    if view.is_null() {
+        return Err("native view is null".to_string());
     }
 
-    let bounds = NSView::bounds(content_view);
+    let bounds = NSView::bounds(view);
     Ok((bounds.size.width, bounds.size.height))
 }
 
@@ -410,7 +475,9 @@ fn sync_estimated_overlay_frames(
     window: &WebviewWindow,
     inner: Arc<Mutex<WgpuSlotInnerState>>,
 ) -> Result<(), String> {
-    let content_view_ptr = get_main_content_view_ptr(window)?;
+    let viewport_view_ptr = get_viewport_view_ptr(window)?;
+    let overlay_host_ptr =
+        unsafe { get_superview_ptr(viewport_view_ptr)? }.unwrap_or(viewport_view_ptr);
     let dpr = window
         .scale_factor()
         .map_err(|e| format!("failed to get window scale factor: {e}"))?;
@@ -419,14 +486,14 @@ fn sync_estimated_overlay_frames(
         let mut inner = inner
             .lock()
             .map_err(|_| "slot state lock poisoned".to_string())?;
-        let (_, content_height) = unsafe { get_content_view_size(content_view_ptr)? };
         let _transaction = unsafe { NoAnimationTransaction::begin() };
 
         for slot in inner.slots.values_mut() {
             unsafe {
                 update_overlay_frame(
+                    viewport_view_ptr,
+                    overlay_host_ptr,
                     slot.native_view_ptr,
-                    content_height,
                     slot.x,
                     slot.y,
                     slot.width,
@@ -502,14 +569,15 @@ fn wgpu_slots_sync_batch(
             .get_webview_window("main")
             .ok_or_else(|| "main window was not found".to_string())?;
 
-        let content_view_ptr = get_main_content_view_ptr(&window)?;
+        let viewport_view_ptr = get_viewport_view_ptr(&window)?;
+        let overlay_host_ptr =
+            unsafe { get_superview_ptr(viewport_view_ptr)? }.unwrap_or(viewport_view_ptr);
         let inner = state.inner.clone();
 
         run_on_main_thread_sync(&window, move || {
             let mut inner = inner
                 .lock()
                 .map_err(|_| "slot state lock poisoned".to_string())?;
-            let (_, content_height) = unsafe { get_content_view_size(content_view_ptr)? };
             let _transaction = unsafe { NoAnimationTransaction::begin() };
 
             for update in payload.updates {
@@ -524,7 +592,7 @@ fn wgpu_slots_sync_batch(
                 if !update.mounted {
                     if let Some(slot) = inner.slots.remove(&update.id) {
                         unsafe {
-                            remove_overlay_view(content_view_ptr, slot.native_view_ptr);
+                            remove_overlay_view(overlay_host_ptr, slot.native_view_ptr);
                         }
                     }
                     continue;
@@ -533,7 +601,7 @@ fn wgpu_slots_sync_batch(
                 let native_view_ptr = match inner.slots.get(&update.id) {
                     Some(slot) => slot.native_view_ptr,
                     None => {
-                        let native_view_ptr = unsafe { create_overlay_view(content_view_ptr)? };
+                        let native_view_ptr = unsafe { create_overlay_view(overlay_host_ptr)? };
                         inner.slots.insert(
                             update.id.clone(),
                             SlotEntry {
@@ -569,8 +637,9 @@ fn wgpu_slots_sync_batch(
 
                 unsafe {
                     update_overlay_frame(
+                        viewport_view_ptr,
+                        overlay_host_ptr,
                         native_view_ptr,
-                        content_height,
                         update.x,
                         update.y,
                         update.width,
@@ -622,7 +691,7 @@ fn wgpu_slots_sync_batch(
                     .filter_map(|slot_id| inner.slots.get(slot_id).map(|slot| slot.native_view_ptr))
                     .collect::<Vec<_>>();
                 unsafe {
-                    reorder_overlay_views(content_view_ptr, &reorder_ptrs)?;
+                    reorder_overlay_views(overlay_host_ptr, &reorder_ptrs)?;
                 }
                 inner.native_order = target_order;
             }
