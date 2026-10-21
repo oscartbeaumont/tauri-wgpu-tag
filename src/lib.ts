@@ -21,6 +21,7 @@ type SlotSyncBatchPayload = {
 const TAG_NAME = "tauri-wgpu";
 const DIRTY_ELEMENTS = new Set<TauriWgpuElement>();
 const PENDING_UPDATES = new Map<string, SlotSyncUpdate>();
+const RESIZE_OBSERVERS = new WeakMap<TauriWgpuElement, ResizeObserver>();
 
 let rafId: number | null = null;
 let syncInFlight = false;
@@ -75,6 +76,11 @@ function invalidateAll(): void {
   document
     .querySelectorAll<TauriWgpuElement>(TAG_NAME)
     .forEach((element) => DIRTY_ELEMENTS.add(element));
+}
+
+function invalidateAllAndSchedule(): void {
+  invalidateAll();
+  scheduleFlush();
 }
 
 async function sendSync(payload: SlotSyncBatchPayload): Promise<boolean> {
@@ -197,7 +203,7 @@ class TauriWgpuElement extends HTMLElement {
   }
 
   private applyViewportGeometry(): void {
-    this.style.position = "fixed";
+    this.style.position = "absolute";
     this.style.left = `${this.readNumberAttribute("x")}px`;
     this.style.top = `${this.readNumberAttribute("y")}px`;
     this.style.width = `${Math.max(1, this.readNumberAttribute("width"))}px`;
@@ -214,6 +220,7 @@ class TauriWgpuElement extends HTMLElement {
     }
 
     this.applyViewportGeometry();
+    this.observeLayoutChanges();
     this.mounted = true;
     invalidateAll();
     scheduleFlush();
@@ -221,6 +228,7 @@ class TauriWgpuElement extends HTMLElement {
 
   disconnectedCallback(): void {
     this.mounted = false;
+    this.unobserveLayoutChanges();
     DIRTY_ELEMENTS.delete(this);
     invalidateAll();
     scheduleFlush();
@@ -246,10 +254,11 @@ class TauriWgpuElement extends HTMLElement {
       return;
     }
 
-    const x = this.readNumberAttribute("x");
-    const y = this.readNumberAttribute("y");
-    const width = Math.max(1, this.readNumberAttribute("width"));
-    const height = Math.max(1, this.readNumberAttribute("height"));
+    const rect = this.getBoundingClientRect();
+    const x = rect.left;
+    const y = rect.top;
+    const width = Math.max(1, rect.width);
+    const height = Math.max(1, rect.height);
     const zIndex = toNumber(this.getAttribute("z-index") ?? "0");
     const paintOrder = paintOrderMap.get(this.slotId) ?? 0;
 
@@ -268,10 +277,42 @@ class TauriWgpuElement extends HTMLElement {
 
     enqueueUpdate(payload);
   }
+
+  private observeLayoutChanges(): void {
+    if (RESIZE_OBSERVERS.has(this)) {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      DIRTY_ELEMENTS.add(this);
+      scheduleFlush();
+    });
+
+    observer.observe(this);
+
+    if (this.parentElement) {
+      observer.observe(this.parentElement);
+    }
+
+    RESIZE_OBSERVERS.set(this, observer);
+  }
+
+  private unobserveLayoutChanges(): void {
+    const observer = RESIZE_OBSERVERS.get(this);
+    if (!observer) {
+      return;
+    }
+
+    observer.disconnect();
+    RESIZE_OBSERVERS.delete(this);
+  }
 }
 
 if (!customElements.get(TAG_NAME)) {
   customElements.define(TAG_NAME, TauriWgpuElement);
 }
+
+window.addEventListener("resize", invalidateAllAndSchedule);
+window.addEventListener("scroll", invalidateAllAndSchedule, true);
 
 export {};
