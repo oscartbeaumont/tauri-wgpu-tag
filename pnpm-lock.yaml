@@ -646,8 +646,8 @@ packages:
     peerDependencies:
       seroval: ^1.0
 
-  seroval@1.5.1:
-    resolution: {integrity: sha512-OwrZRZAfhHww0WEnKHDY8OM0U/Qs8OTfIDWhUD4BLpNJUfXK4cGmjiagGze086m+mhI+V2nD0gfbHEnJjb9STA==}
+  seroval@1.5.6:
+    resolution: {integrity: sha512-rVQVWjjSvlINzaQPZH5JFqsqEsIWdTxY3iJZCnTL/5gQbXIRooVZKI60tVCkOVfzcRPejboxO2t0P89dg5mQaA==}
     engines: {node: '>=10'}
 
   solid-js@1.9.11:
@@ -1250,17 +1250,17 @@ snapshots:
 
   semver@6.3.1: {}
 
-  seroval-plugins@1.5.1(seroval@1.5.1):
+  seroval-plugins@1.5.1(seroval@1.5.6):
     dependencies:
-      seroval: 1.5.1
+      seroval: 1.5.6
 
-  seroval@1.5.1: {}
+  seroval@1.5.6: {}
 
   solid-js@1.9.11:
     dependencies:
       csstype: 3.2.3
-      seroval: 1.5.1
-      seroval-plugins: 1.5.1(seroval@1.5.1)
+      seroval: 1.5.6
+      seroval-plugins: 1.5.1(seroval@1.5.6)
 
   solid-refresh@0.6.3(solid-js@1.9.11):
     dependencies:
